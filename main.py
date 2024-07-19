@@ -6,6 +6,7 @@ from typing import List, Optional, Set, Dict
 from contextlib import asynccontextmanager
 
 import aiohttp
+import aiofiles
 from fastapi import FastAPI
 from pydantic import BaseModel, HttpUrl, Field
 from dotenv import load_dotenv
@@ -31,8 +32,7 @@ class Config(BaseModel):
     link_pattern: str = r'(?i)\b((?:https?://|www\d{0,3}[.]|[a-z0-9.\-]+[.][a-z]{2,4}/)(?:[^\s()<>]+|\(([^\s()<>]+|(\([^\s()<>]+\)))*\))+(?:\(([^\s()<>]+|(\([^\s()<>]+\)))*\)|[^\s`!()\[\]{};:\'".,<>?«»""'']))'
     whitelisted_users: Set[int] = Field(default_factory=set)
     cache_file: str = "last_processed_post.txt"
-    batchlimit: int = 100
-    cycle_time: int = 60
+    cycle_time: int = 30
     allow_links: bool = False
     allowed_urls: List[str] = []
     blocked_urls: List[str] = []
@@ -54,12 +54,13 @@ link_regex = re.compile(config.link_pattern, re.IGNORECASE)
 
 last_processed_post_id: str = ""
 
-def load_cache():
+async def load_cache():
     global last_processed_post_id
     try:
         if os.path.exists(config.cache_file):
-            with open(config.cache_file, 'r') as f:
-                last_processed_post_id = f.read().strip()
+            async with aiofiles.open(config.cache_file, 'r') as f:
+                last_processed_post_id = await f.read()
+            last_processed_post_id = last_processed_post_id.strip()
             if last_processed_post_id:
                 logger.info(f"Loaded last processed post ID: {last_processed_post_id}")
             else:
@@ -74,14 +75,13 @@ async def save_cache():
     global last_processed_post_id
     if last_processed_post_id:
         try:
-            with open(config.cache_file, 'w') as f:
-                f.write(str(last_processed_post_id))
+            async with aiofiles.open(config.cache_file, 'w') as f:
+                await f.write(str(last_processed_post_id))
             logger.info(f"Saved last processed post ID: {last_processed_post_id}")
         except Exception as e:
             logger.error(f"Error saving cache: {e}")
     else:
         logger.warning("No post ID to save. Cache file not updated.")
-
 
 async def get_token(session: aiohttp.ClientSession) -> Optional[str]:
     auth_url = "https://auth.roblox.com/v2/logout"
@@ -125,75 +125,84 @@ def contains_link(text: str) -> bool:
             return True
     return False
 
+async def get_latest_posts(session: aiohttp.ClientSession, headers: dict, limit: int = 10) -> List[dict]:
+    roblox_url = f"https://groups.roblox.com/v1/groups/{config.group}/wall/posts?limit={limit}&sortOrder=Desc"
+    try:
+        async with session.get(roblox_url, headers=headers) as response:
+            if response.status != 200:
+                logger.error(f"Failed to get latest posts: {response.status}")
+                return []
+            data = await response.json()
+            return data.get("data", [])
+    except aiohttp.ClientError as e:
+        logger.error(f"Error occurred while fetching latest posts: {e}")
+        return []
+
 async def filter_wall(session: aiohttp.ClientSession, token: str):
     global last_processed_post_id
+    logger.info(f"Starting filter_wall function. Last processed post ID: {last_processed_post_id}")
+    
     headers = {
         "X-CSRF-TOKEN": token,
         "Content-Type": "application/json"
     }
 
-    roblox_url = f"https://groups.roblox.com/v1/groups/{config.group}/wall/posts?limit={config.batchlimit}&sortOrder=Desc"
+    recent_posts = await get_latest_posts(session, headers, limit=10)
+    
+    if not recent_posts:
+        logger.info("No posts found.")
+        return
+    
+    latest_post_id = str(recent_posts[0]["id"])
+    
+    if latest_post_id == last_processed_post_id:
+        logger.info("No new posts to process.")
+        return
+    
+    logger.info(f"New posts detected. Latest post ID: {latest_post_id}")
 
-    try:
-        async with session.get(roblox_url, headers=headers) as response:
-            if response.status != 200:
-                logger.error(f"Failed to get group wall posts: {response.status}")
-                return
+    all_posts = await get_latest_posts(session, headers, limit=100)
 
-            posts = (await response.json())["data"]
+    new_posts = []
+    for post in all_posts:
+        if str(post["id"]) == last_processed_post_id:
+            break
+        new_posts.append(post)
 
-            if not posts:
-                logger.info("No posts found.")
-                return
+    logger.info(f"Processing {len(new_posts)} new posts")
 
-            logger.info(f"Fetched {len(posts)} posts. Last processed post ID: {last_processed_post_id}")
+    for post in reversed(new_posts):
+        post_id = str(post["id"])
+        body_text = post["body"]
+        user_id = post["poster"]["userId"]
 
-            new_posts = []
-            for post in posts:
-                if str(post["id"]) == last_processed_post_id:
-                    logger.info(f"Reached last processed post: {last_processed_post_id}")
-                    break
-                new_posts.append(post)
+        logger.info(f"Processing post {post_id}: {body_text[:50]}...")
 
-            if not new_posts:
-                logger.info("No new posts to process.")
-                return
+        if user_id in config.whitelisted_users:
+            logger.info(f"User {user_id} is whitelisted. Skipping filters.")
+            continue
 
-            logger.info(f"Processing {len(new_posts)} new posts")
+        detected_word = next((word for word in config.filter_list if word.lower() in body_text.lower()), None)
+        link_detected = contains_link(body_text)
 
-            for post in reversed(new_posts):
-                post_id = post["id"]
-                body_text = post["body"]
-                user_id = post["poster"]["userId"]
+        if detected_word:
+            logger.info(f"Filtered word detected: {detected_word}")
+            await delete_post(session, headers, post, f"Filtered word: {detected_word}")
+        elif link_detected:
+            logger.info("Link detected in post")
+            await delete_post(session, headers, post, "Link detected")
+        elif await check_openai_moderation(session, body_text):
+            logger.info("OpenAI moderation flagged the post")
+            await delete_post(session, headers, post, "OpenAI moderation")
+        else:
+            logger.info("Post passed all checks")
 
-                logger.info(f"Processing post {post_id}: {body_text[:50]}...")
+    last_processed_post_id = latest_post_id
+    logger.info(f"Updating last processed post ID to: {last_processed_post_id}")
+    await save_cache()
 
-                if user_id in config.whitelisted_users:
-                    logger.info(f"User {user_id} is whitelisted. Skipping filters.")
-                    last_processed_post_id = post["id"]
-                    continue
+    logger.info(f"Finished processing posts. Last processed post ID: {last_processed_post_id}")
 
-                detected_word = next((word for word in config.filter_list if word.lower() in body_text.lower()), None)
-                link_detected = contains_link(body_text)
-
-                if detected_word:
-                    logger.info(f"Filtered word detected: {detected_word}")
-                    await delete_post(session, headers, post, f"Filtered word: {detected_word}")
-                elif link_detected:
-                    logger.info("Link detected in post")
-                    await delete_post(session, headers, post, "Link detected")
-                elif await check_openai_moderation(session, body_text):
-                    logger.info("OpenAI moderation flagged the post")
-                    await delete_post(session, headers, post, "OpenAI moderation")
-                else:
-                    logger.info("Post passed all checks")
-                    last_processed_post_id = post["id"]
-
-            logger.info(f"Updating last processed post ID to: {last_processed_post_id}")
-            await save_cache()
-
-    except aiohttp.ClientError as e:
-        logger.error(f"Error occurred while filtering wall: {e}")
 async def delete_post(session: aiohttp.ClientSession, headers: dict, post: dict, detected_word: str):
     post_id = post["id"]
     username = post["poster"]["username"]
@@ -254,7 +263,7 @@ async def run_filter():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    load_cache()
+    await load_cache()
     filter_task = asyncio.create_task(run_filter())
     yield
     # Shutdown
