@@ -166,6 +166,7 @@ async def filter_wall(session: aiohttp.ClientSession, token: str):
 
                 if user_id in config.whitelisted_users:
                     logger.info(f"User {user_id} is whitelisted. Skipping filters.")
+                    last_processed_post_id = post["id"]
                     continue
 
                 detected_word = next((word for word in config.filter_list if word.lower() in body_text.lower()), None)
@@ -182,17 +183,13 @@ async def filter_wall(session: aiohttp.ClientSession, token: str):
                     await delete_post(session, headers, post, "OpenAI moderation")
                 else:
                     logger.info("Post passed all checks")
+                    last_processed_post_id = post["id"]
 
-            if new_posts:
-                last_processed_post_id = new_posts[0]["id"]
-                logger.info(f"Updating last processed post ID to: {last_processed_post_id}")
-                await save_cache()
-            else:
-                logger.info("No new posts processed. Cache not updated.")
+            logger.info(f"Updating last processed post ID to: {last_processed_post_id}")
+            await save_cache()
 
     except aiohttp.ClientError as e:
         logger.error(f"Error occurred while filtering wall: {e}")
-
 async def delete_post(session: aiohttp.ClientSession, headers: dict, post: dict, detected_word: str):
     post_id = post["id"]
     username = post["poster"]["username"]
