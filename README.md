@@ -1,0 +1,1 @@
+Check out the DevForum Guide for how to use: https://devforum.roblox.com/t/advanced-group-wall-filter-automated-moderation-for-your-roblox-group/3076359
