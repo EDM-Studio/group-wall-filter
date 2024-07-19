@@ -33,6 +33,9 @@ class Config(BaseModel):
     cache_file: str = "last_processed_post.txt"
     batchlimit: int = 100
     cycle_time: int = 60
+    allow_links: bool = False
+    allowed_urls: List[str] = []
+    blocked_urls: List[str] = []
 
 config = Config(
     group=os.getenv("GROUP", ""),
@@ -41,7 +44,10 @@ config = Config(
     webhook_username=os.getenv("WEBHOOK_USERNAME", "Group Wall Filter"),
     webhook_image=os.getenv("WEBHOOK_IMAGE"),
     openai_api_key=os.getenv("OPENAI_API_KEY", ""),
-    whitelisted_users=set(map(int, os.getenv("WHITELISTED_USERS", "").split(","))) if os.getenv("WHITELISTED_USERS") else set()
+    whitelisted_users=set(map(int, os.getenv("WHITELISTED_USERS", "").split(","))) if os.getenv("WHITELISTED_USERS") else set(),
+    allow_links=os.getenv("ALLOW_LINKS", "false").lower() == "true",
+    allowed_urls=os.getenv("ALLOWED_URLS", "").split(",") if os.getenv("ALLOWED_URLS") else [],
+    blocked_urls=os.getenv("BLOCKED_URLS", "").split(",") if os.getenv("BLOCKED_URLS") else [],
 )
 
 link_regex = re.compile(config.link_pattern, re.IGNORECASE)
@@ -110,15 +116,13 @@ async def check_openai_moderation(session: aiohttp.ClientSession, text: str) -> 
 
 def contains_link(text: str) -> bool:
     if link_regex.search(text):
-        return True
-    
-    words = text.split()
-    for word in words:
-        if '.' in word and not word.startswith('.') and not word.endswith('.'):
-            parts = word.split('.')
-            if len(parts) == 2 and len(parts[1]) >= 2:
-                return True
-    
+        url = link_regex.search(text).group()
+        if config.allowed_urls and any(allowed in url for allowed in config.allowed_urls):
+            return False
+        if config.blocked_urls and any(blocked in url for blocked in config.blocked_urls):
+            return True
+        if not config.allow_links:
+            return True
     return False
 
 async def filter_wall(session: aiohttp.ClientSession, token: str):
